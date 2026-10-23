@@ -84,6 +84,11 @@ MAX_CHUNK_SIZE = 31 * 1024 * 1024
 # outage still fails fast.
 SNAP_TIMEOUT = (10, 180)
 SNAP_UPLOAD_TIMEOUT = (10, 300)
+# Create Media is a tiny JSON call that Snap answers in well under a second,
+# and it only reserves an (unpublished) upload slot - so it gets a short read
+# timeout and is safe to retry, unlike the publish call below.
+CREATE_MEDIA_TIMEOUT = (10, 10)
+CREATE_MEDIA_RETRIES = 2
 
 # A timeout on the publish call itself is deliberately NOT retried: Snap may
 # have accepted the post and only the response got lost, so a blind retry
@@ -99,26 +104,38 @@ PUBLISH_TIMEOUT_STEP = (
 STORY_WIDTH = 1080
 STORY_HEIGHT = 1920
 
-# One session per host for connection reuse across the many calls each caller makes.
-IG_SESSION = requests.Session()
-SNAP_SESSION = requests.Session()
+# No shared requests.Session (keep-alive connection pool) for the Snapchat or
+# Instagram calls: in the long-running Streamlit app on Azure App Service, a
+# pooled connection left idle between publishes (>~4 min) gets silently
+# dropped by Azure's outbound load balancer. The next call - always Create
+# Media, the first Snap call of a publish - was then written into that dead
+# socket and hung until the 180s read timeout, every time. A fresh connection
+# per call costs a TLS handshake, negligible next to the media upload.
 
 
 def _full_url(base: str, path_or_url: str) -> str:
     return path_or_url if path_or_url.startswith("http") else f"{base}{path_or_url}"
 
 
-def _snap_post(path_or_url: str, access_token: str, step: str, **kwargs) -> requests.Response:
+def _snap_post(path_or_url: str, access_token: str, step: str, retries: int = 0, **kwargs) -> requests.Response:
     """`step` names the call in the error if Snap doesn't answer in time, so a
-    timeout says which part of the publish flow it hit."""
-    try:
-        return SNAP_SESSION.post(
-            _full_url(BUSINESS_API_BASE, path_or_url),
-            headers={"Authorization": f"Bearer {access_token}"},
-            **kwargs,
-        )
-    except requests.Timeout as e:
-        raise RuntimeError(f"Snapchat didn't respond in time during {step}: {e}") from e
+    timeout says which part of the publish flow it hit. `retries` re-sends on
+    a timeout/dropped connection - only for calls that are safe to repeat
+    (never the publish call, see PUBLISH_TIMEOUT_STEP)."""
+    for attempt in range(retries + 1):
+        try:
+            return requests.post(
+                _full_url(BUSINESS_API_BASE, path_or_url),
+                headers={"Authorization": f"Bearer {access_token}"},
+                **kwargs,
+            )
+        except (requests.Timeout, requests.ConnectionError) as e:
+            if attempt < retries:
+                logger.warning(f"Snapchat {step} failed ({e}), retrying ({attempt + 1}/{retries})...")
+                continue
+            if isinstance(e, requests.Timeout):
+                raise RuntimeError(f"Snapchat didn't respond in time during {step}: {e}") from e
+            raise
 
 
 # ---------------- Instagram (source) ----------------
@@ -153,7 +170,7 @@ def get_ig_json(url_or_path: str, params: dict | None = None, timeout: int = 60)
     path = url_or_path if url_or_path.startswith("http") else "/" + url_or_path.lstrip("/")
     url = _strip_access_token(_full_url(GRAPH, path))
     try:
-        r = IG_SESSION.get(
+        r = requests.get(
             url, params=params, headers={"Authorization": f"Bearer {ACCESS_TOKEN}"}, timeout=timeout,
         )
     except requests.RequestException as e:
@@ -388,13 +405,14 @@ def create_media(access_token: str, media_type: str, name: str, key: bytes, iv: 
         f"/v1/public_profiles/{SNAPCHAT_PROFILE_ID}/media",
         access_token,
         "Create Media",
+        retries=CREATE_MEDIA_RETRIES,
         json={
             "type": media_type,  # "VIDEO" or "IMAGE"
             "name": name,
             "key": base64.b64encode(key).decode(),
             "iv": base64.b64encode(iv).decode(),
         },
-        timeout=SNAP_TIMEOUT,
+        timeout=CREATE_MEDIA_TIMEOUT,
     )
     if not r.ok:
         raise RuntimeError(f"Create Media failed ({r.status_code}): {r.text}")
